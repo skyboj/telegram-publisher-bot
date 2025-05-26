@@ -32,17 +32,30 @@ class ArticleGenerator:
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
         # WordPress configuration
-        self.wp_site_url = os.getenv('WORDPRESS_SITE_URL')
+        self.wp_site_url = os.getenv('WORDPRESS_SITE_URL').rstrip('/')
         self.wp_oauth_token = os.getenv('WORDPRESS_OAUTH_TOKEN')
-        self.wp_api_base = f"{self.wp_site_url.rstrip('/')}/wp-json/wp/v2"
         
-        # Get WordPress categories
-        self.wp_categories = [cat.strip() for cat in os.getenv('WORDPRESS_CATEGORIES', '').split(',')]
+        # For WordPress.com sites, we use the public-api.wordpress.com endpoint
+        if '.wordpress.com' in self.wp_site_url:
+            site_name = self.wp_site_url.split('//')[1].split('.')[0]
+            self.wp_api_base = f"https://public-api.wordpress.com/wp/v2/sites/{site_name}.wordpress.com"
+        else:
+            self.wp_api_base = f"{self.wp_site_url}/wp-json/wp/v2"
+        
+        # Get WordPress categories and convert to integers
+        try:
+            self.wp_categories = [int(cat.strip()) for cat in os.getenv('WORDPRESS_CATEGORIES', '').split(',') if cat.strip().isdigit()]
+            if not self.wp_categories:
+                logger.warning("No valid category IDs found in WORDPRESS_CATEGORIES")
+        except (ValueError, AttributeError) as e:
+            logger.error(f"Error parsing WordPress categories: {str(e)}")
+            self.wp_categories = []
         
         # Unsplash configuration
         self.unsplash_access_key = os.getenv('UNSPLASH_ACCESS_KEY')
         
-        logger.info("ArticleGenerator initialized successfully")
+        logger.info(f"ArticleGenerator initialized with WordPress API: {self.wp_api_base}")
+        logger.info(f"Using WordPress categories: {self.wp_categories}")
 
     async def generate_article(self, topic: str) -> Dict[str, str]:
         """Generate an article using OpenAI API."""
@@ -170,23 +183,30 @@ class ArticleGenerator:
             # Prepare image file
             image_filename = f"article-image-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
             
-            # Upload image to WordPress
+            # Headers for WordPress API
             headers = {
-                'Authorization': f'Bearer {self.wp_oauth_token}'
+                'Authorization': f'Bearer {self.wp_oauth_token}',
+                'Content-Type': 'application/json'
             }
 
-            files = {
-                'file': (image_filename, image_response.content, 'image/jpeg')
+            # For media upload, we need different headers
+            media_headers = {
+                'Authorization': f'Bearer {self.wp_oauth_token}',
+                'Content-Type': 'image/jpeg',
+                'Content-Disposition': f'attachment; filename={image_filename}'
             }
 
-            # Upload image
+            # Upload image using the binary content directly
             image_upload_response = requests.post(
                 f"{self.wp_api_base}/media",
-                headers=headers,
-                files=files
+                headers=media_headers,
+                data=image_response.content
             )
-            image_upload_response.raise_for_status()
             
+            if image_upload_response.status_code != 201:
+                logger.error(f"Failed to upload image. Status: {image_upload_response.status_code}, Response: {image_upload_response.text}")
+                raise Exception(f"Failed to upload image: {image_upload_response.text}")
+                
             image_data = image_upload_response.json()
             image_id = image_data['id']
             
@@ -202,9 +222,12 @@ class ArticleGenerator:
                 'title': article['title'],
                 'content': content,
                 'status': 'draft',
-                'featured_media': image_id,
-                'categories': self.wp_categories
+                'featured_media': image_id
             }
+
+            # Add categories only if we have valid ones
+            if self.wp_categories:
+                post_data['categories'] = self.wp_categories
 
             # Schedule post for tomorrow at 6:03 AM Edinburgh time
             edinburgh_tz = pytz.timezone('Europe/London')
@@ -212,18 +235,21 @@ class ArticleGenerator:
             tomorrow = now + timedelta(days=1)
             schedule_time = tomorrow.replace(hour=6, minute=3, second=0, microsecond=0)
             
-            post_data['date'] = schedule_time.isoformat()
+            post_data['date_gmt'] = schedule_time.astimezone(pytz.UTC).strftime('%Y-%m-%dT%H:%M:%S')
 
             # Create post
             post_response = requests.post(
                 f"{self.wp_api_base}/posts",
-                headers={**headers, 'Content-Type': 'application/json'},
+                headers=headers,
                 json=post_data
             )
-            post_response.raise_for_status()
+            
+            if post_response.status_code not in [200, 201]:
+                logger.error(f"Failed to create post. Status: {post_response.status_code}, Response: {post_response.text}")
+                raise Exception(f"Failed to create post: {post_response.text}")
 
             post_data = post_response.json()
-            return post_data['link']
+            return post_data.get('link', post_data.get('URL', ''))
 
         except Exception as e:
             logger.error(f"Error publishing to WordPress: {str(e)}")
