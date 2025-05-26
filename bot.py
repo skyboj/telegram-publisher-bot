@@ -3,6 +3,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 import pytz
+import re
 from typing import Dict, Any
 import psutil
 import sys
@@ -54,8 +55,22 @@ class ArticleGenerator:
         # Unsplash configuration
         self.unsplash_access_key = os.getenv('UNSPLASH_ACCESS_KEY')
         
+        # QLOGA app URL
+        self.qloga_app_url = "https://play.google.com/store/apps/details?id=eac.qloga.android"
+        
         logger.info(f"ArticleGenerator initialized with WordPress API: {self.wp_api_base}")
         logger.info(f"Using WordPress categories: {self.wp_categories}")
+
+    def _format_qloga_mentions(self, text: str) -> str:
+        """Format all mentions of QLOGA to be uppercase and linked to the app store."""
+        # Pattern matches 'qloga', 'Qloga', 'QLOGA' in any case
+        pattern = re.compile(r'qloga', re.IGNORECASE)
+        
+        def replace_func(match):
+            # Convert to uppercase and add link
+            return f'<a href="{self.qloga_app_url}">QLOGA</a>'
+        
+        return pattern.sub(replace_func, text)
 
     async def generate_article(self, topic: str) -> Dict[str, str]:
         """Generate an article using OpenAI API."""
@@ -95,7 +110,9 @@ class ArticleGenerator:
             - A strong conclusion
             - Relevant local information about Scotland/Edinburgh
             - SEO-optimized content
-            - Proper HTML formatting with <h2>, <p>, <ul> tags etc."""
+            - Proper HTML formatting with <h2>, <p>, <ul> tags etc.
+            
+            If mentioning QLOGA, ensure it's relevant to the context."""
 
             response = self.client.chat.completions.create(
                 model="gpt-3.5-turbo",
@@ -111,6 +128,11 @@ class ArticleGenerator:
 
             # Extract the function call arguments
             article = json.loads(response.choices[0].message.function_call.arguments)
+            
+            # Format QLOGA mentions in title, subtitle, and content
+            article['title'] = self._format_qloga_mentions(article['title'])
+            article['subtitle'] = self._format_qloga_mentions(article['subtitle'])
+            article['content'] = self._format_qloga_mentions(article['content'])
             
             # Validate and trim content if needed
             if len(article['title']) > 60:
@@ -171,6 +193,64 @@ class ArticleGenerator:
             logger.error(f"Error generating image: {str(e)}")
             raise
 
+    async def _get_scheduled_posts(self) -> list:
+        """Get all scheduled posts from WordPress."""
+        try:
+            headers = {
+                'Authorization': f'Bearer {self.wp_oauth_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            # Get posts with 'future' status (scheduled)
+            response = requests.get(
+                f"{self.wp_api_base}/posts",
+                headers=headers,
+                params={
+                    'status': 'future',
+                    'per_page': 100  # Maximum number of posts to retrieve
+                }
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to get scheduled posts. Status: {response.status_code}, Response: {response.text}")
+                return []
+                
+            return response.json()
+        except Exception as e:
+            logger.error(f"Error getting scheduled posts: {str(e)}")
+            return []
+
+    async def _find_next_available_date(self) -> datetime:
+        """Find the next available date for publication at 6:03 AM Edinburgh time."""
+        edinburgh_tz = pytz.timezone('Europe/London')
+        now = datetime.now(edinburgh_tz)
+        
+        # Start checking from tomorrow
+        check_date = now + timedelta(days=1)
+        check_date = check_date.replace(hour=6, minute=3, second=0, microsecond=0)
+        
+        # Get all scheduled posts
+        scheduled_posts = await self._get_scheduled_posts()
+        scheduled_dates = []
+        
+        # Extract scheduled dates
+        for post in scheduled_posts:
+            try:
+                # WordPress returns dates in UTC
+                post_date = datetime.fromisoformat(post['date_gmt'].replace('Z', '+00:00'))
+                post_date = post_date.astimezone(edinburgh_tz)
+                scheduled_dates.append(post_date.date())
+            except (KeyError, ValueError) as e:
+                logger.error(f"Error parsing post date: {str(e)}")
+                continue
+        
+        # Find the next available date
+        while check_date.date() in scheduled_dates:
+            check_date += timedelta(days=1)
+            check_date = check_date.replace(hour=6, minute=3, second=0, microsecond=0)
+        
+        return check_date
+
     async def publish_to_wordpress(self, article: Dict[str, str], image_url: str) -> str:
         """Publish the article and image to WordPress."""
         try:
@@ -221,7 +301,7 @@ class ArticleGenerator:
             post_data = {
                 'title': article['title'],
                 'content': content,
-                'status': 'draft',
+                'status': 'future',
                 'featured_media': image_id
             }
 
@@ -229,13 +309,12 @@ class ArticleGenerator:
             if self.wp_categories:
                 post_data['categories'] = self.wp_categories
 
-            # Schedule post for tomorrow at 6:03 AM Edinburgh time
-            edinburgh_tz = pytz.timezone('Europe/London')
-            now = datetime.now(edinburgh_tz)
-            tomorrow = now + timedelta(days=1)
-            schedule_time = tomorrow.replace(hour=6, minute=3, second=0, microsecond=0)
+            # Find next available publication date
+            publication_date = await self._find_next_available_date()
+            logger.info(f"Scheduling post for: {publication_date.isoformat()}")
             
-            post_data['date_gmt'] = schedule_time.astimezone(pytz.UTC).strftime('%Y-%m-%dT%H:%M:%S')
+            # Convert to UTC for WordPress
+            post_data['date_gmt'] = publication_date.astimezone(pytz.UTC).strftime('%Y-%m-%dT%H:%M:%S')
 
             # Create post
             post_response = requests.post(
@@ -291,13 +370,17 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("🌐 Publishing to WordPress...")
         post_url = await generator.publish_to_wordpress(article, image_url)
 
+        # Get the scheduled publication date
+        publication_date = await generator._find_next_available_date()
+        formatted_date = publication_date.strftime("%d %B %Y")
+
         # Send success message
         success_message = f"""✅ Article published successfully!
 
 📑 Title: {article['title']}
 🔗 URL: {post_url}
 
-The article will be scheduled for publication tomorrow at 6:03 AM Edinburgh time."""
+The article is scheduled for publication on {formatted_date} at 6:03 AM Edinburgh time."""
 
         await update.message.reply_text(success_message)
 
