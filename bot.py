@@ -340,19 +340,93 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 I can help you create and publish articles about various topics, optimized for Scotland and Edinburgh.
 
-Simply send me a topic, and I will:
-1. Generate an SEO-optimized article
-2. Find a relevant image
-3. Publish it to WordPress
+You can:
+1. Send a single topic for one article
+2. Send a numbered list of topics to process them sequentially
 
-Try it now - just send me a topic! 📝"""
+For example:
+1. Best Coffee Shops in Edinburgh
+2. Hidden Gems of the Royal Mile
+3. Day Trips from Edinburgh
+4. Edinburgh's Secret Gardens
+5. Best Viewpoints in the City
+
+Each article will be:
+1. Generated with SEO optimization
+2. Enhanced with a relevant image
+3. Published to WordPress
+
+Try it now - send me a topic or a list of topics! 📝"""
     
     await update.message.reply_text(welcome_message)
+
+async def process_topic_list(update: Update, topics: list) -> None:
+    """Process a list of topics sequentially."""
+    try:
+        total_topics = len(topics)
+        await update.message.reply_text(f"📋 Received {total_topics} topics to process. Starting generation...")
+
+        for index, topic in enumerate(topics, 1):
+            await update.message.reply_text(f"🔄 Processing topic {index}/{total_topics}: {topic}")
+            
+            # Create article generator
+            generator = ArticleGenerator()
+
+            # Generate article
+            await update.message.reply_text("📝 Generating article content...")
+            article = await generator.generate_article(topic)
+
+            # Generate image
+            await update.message.reply_text("🖼 Finding a perfect image...")
+            image_url = await generator.generate_image(topic)
+
+            # Publish to WordPress
+            await update.message.reply_text("🌐 Publishing to WordPress...")
+            post_url = await generator.publish_to_wordpress(article, image_url)
+
+            # Get the scheduled publication date
+            publication_date = await generator._find_next_available_date()
+            formatted_date = publication_date.strftime("%d %B %Y")
+
+            # Send success message for this topic
+            success_message = f"""✅ Article {index}/{total_topics} published successfully!
+
+📑 Title: {article['title']}
+🔗 URL: {post_url}
+
+The article is scheduled for publication on {formatted_date} at 6:03 AM Edinburgh time."""
+
+            await update.message.reply_text(success_message)
+
+    except Exception as e:
+        error_message = f"❌ Error processing topic list at item {index}: {str(e)}"
+        logger.error(error_message)
+        await update.message.reply_text(error_message)
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming topic messages."""
     try:
-        topic = update.message.text.strip()
+        message_text = update.message.text.strip()
+        
+        # Check if the message is a numbered list
+        lines = message_text.split('\n')
+        if len(lines) > 1:
+            # Extract topics from numbered list
+            topics = []
+            for line in lines:
+                line = line.strip()
+                # Match any number followed by a dot at the start of the line
+                if line and re.match(r'^\d+\.', line):
+                    topic = line.split('.', 1)[1].strip()
+                    if topic:
+                        topics.append(topic)
+            
+            if topics:
+                await process_topic_list(update, topics)
+                return
+
+        # If not a list, process as a single topic
+        topic = message_text
         await update.message.reply_text("🎨 Starting article generation process...")
 
         # Create article generator

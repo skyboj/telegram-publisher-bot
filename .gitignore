@@ -44,4 +44,11 @@ ENV/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
-Thumbs.db 
+Thumbs.db
+
+# Database files
+articles.db
+schema.sql
+
+# Environment files
+.env.example 
